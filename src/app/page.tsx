@@ -1,43 +1,107 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
 import Image from "next/image";
-import { makePassportPhoto, validatePhoto, PhotoResult } from "@/lib/photo";
+import { preparePhoto, renderPreparedPhoto, validatePhoto, PhotoResult } from "@/lib/photo";
 
 type Stage = "idle" | "processing" | "ready" | "paying";
 
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const objectUrls = useRef(new Set<string>());
+  const renderSequence = useRef(0);
+  const currentResultUrl = useRef<string | null>(null);
   const [stage, setStage] = useState<Stage>("idle");
   const [result, setResult] = useState<PhotoResult | null>(null);
   const [original, setOriginal] = useState<string | null>(null);
+  const [preparedSource, setPreparedSource] = useState<{ url: string; backgroundRemoved: boolean } | null>(null);
   const [message, setMessage] = useState("");
-  const removeBackground = true;
+  const [removeBackground, setRemoveBackground] = useState(true);
   const [dragging, setDragging] = useState(false);
   const [orderId, setOrderId] = useState<string | null>(null);
   const [paid, setPaid] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [verticalPosition, setVerticalPosition] = useState(0.5);
+  const [updatingFrame, setUpdatingFrame] = useState(false);
+  const [frameWasAdjusted, setFrameWasAdjusted] = useState(false);
+
+  function makeObjectUrl(blob: Blob) {
+    const url = URL.createObjectURL(blob);
+    objectUrls.current.add(url);
+    return url;
+  }
+
+  function revokeObjectUrl(url?: string | null) {
+    if (url && objectUrls.current.delete(url)) URL.revokeObjectURL(url);
+  }
+
+  useEffect(() => () => {
+    objectUrls.current.forEach(url => URL.revokeObjectURL(url));
+    objectUrls.current.clear();
+  }, []);
+
+  useEffect(() => {
+    if (!preparedSource || !frameWasAdjusted || stage !== "ready") return;
+    const sequence = ++renderSequence.current;
+    const timer = window.setTimeout(async () => {
+      setUpdatingFrame(true);
+      setMessage("");
+      try {
+        const next = await renderPreparedPhoto(preparedSource.url, preparedSource.backgroundRemoved, zoom, verticalPosition);
+        if (sequence !== renderSequence.current) { URL.revokeObjectURL(next.url); return; }
+        revokeObjectUrl(currentResultUrl.current);
+        objectUrls.current.add(next.url);
+        currentResultUrl.current = next.url;
+        setResult(next);
+      } catch (error) {
+        if (sequence === renderSequence.current) setMessage(error instanceof Error ? error.message : "Could not update the crop. Try again.");
+      } finally {
+        if (sequence === renderSequence.current) setUpdatingFrame(false);
+      }
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [frameWasAdjusted, preparedSource, stage, verticalPosition, zoom]);
 
   async function processPhoto(file?: File) {
     if (!file) return;
     const problem = validatePhoto(file);
     if (problem) { setMessage(problem); return; }
-    if (original) URL.revokeObjectURL(original);
-    if (result) URL.revokeObjectURL(result.url);
-    setMessage(""); setStage("processing"); setResult(null); setOrderId(null); setPaid(false);
-    setOriginal(URL.createObjectURL(file));
+    revokeObjectUrl(original);
+    revokeObjectUrl(result?.url);
+    revokeObjectUrl(preparedSource?.url);
+    renderSequence.current += 1;
+    currentResultUrl.current = null;
+    setUpdatingFrame(false); setMessage(""); setStage("processing"); setResult(null); setOrderId(null); setPaid(false);
+    setPreparedSource(null); setFrameWasAdjusted(false); setZoom(1); setVerticalPosition(0.5);
+    const nextOriginal = makeObjectUrl(file);
+    let nextSourceUrl: string | null = null;
+    setOriginal(nextOriginal);
     try {
-      const photo = await makePassportPhoto(file, removeBackground);
-      setResult(photo); setStage("ready");
+      const source = await preparePhoto(file, removeBackground);
+      objectUrls.current.add(source.sourceUrl);
+      nextSourceUrl = source.sourceUrl;
+      setPreparedSource({ url: source.sourceUrl, backgroundRemoved: source.backgroundRemoved });
+      const photo = await renderPreparedPhoto(source.sourceUrl, source.backgroundRemoved);
+      setResult(photo); objectUrls.current.add(photo.url); currentResultUrl.current = photo.url; setStage("ready");
       if (photo.backgroundRemoved) setMessage("Background removed on your device.");
       else setMessage("Photo ready. White background added; automatic background removal was unavailable, so check the edges before downloading.");
     } catch (error) {
+      revokeObjectUrl(nextSourceUrl);
+      revokeObjectUrl(nextOriginal);
+      setOriginal(null); setPreparedSource(null);
       setStage("idle"); setMessage(error instanceof Error ? error.message : "Could not process that image. Try another photo.");
     }
   }
 
-  function handleChange(event: ChangeEvent<HTMLInputElement>) { void processPhoto(event.target.files?.[0]); }
+  function handleChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    void processPhoto(file);
+  }
   function handleDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault(); setDragging(false); void processPhoto(event.dataTransfer.files?.[0]);
+    event.preventDefault(); setDragging(false);
+    if (stage === "processing" || stage === "paying") return;
+    void processPhoto(event.dataTransfer.files?.[0]);
   }
 
   async function download() {
@@ -72,7 +136,7 @@ export default function Home() {
               if (!verify.ok || data.verified !== true) throw new Error(data.error || "Payment verification failed.");
               savePhoto(result); setPaid(true); setMessage("Payment verified. Your photo has downloaded."); resolve();
             } catch (error) { reject(error); }
-          }, modal: { ondismiss: () => resolve() }, theme: { color: "#2559e8" } });
+          }, modal: { ondismiss: () => { setMessage("Checkout closed. No payment was made."); resolve(); } }, theme: { color: "#315fe8" } });
         checkout.open();
       });
       setStage("ready");
@@ -82,22 +146,24 @@ export default function Home() {
   return <main>
     <header className="topbar"><a className="brand" href="#top" aria-label="PhotoReady home"><span className="brand-mark"><CameraIcon /></span><span>Photo<span className="brand-accent">Ready</span></span></a><a href="#how-it-works" className="top-link">How it works <span>↗</span></a></header>
     <section className="hero" id="top">
-      <div className="hero-copy"><div className="eyebrow"><span className="eyebrow-dot" /> YOUR PHOTO, PASSPORT-READY</div><h1>A passport photo,<br /><span>made simple.</span></h1><p className="hero-lede">Turn a well-lit selfie into a clean, print-ready 35 × 45 mm photo. No studio visit, no fuss.</p>
+      <div className="hero-copy"><div className="eyebrow"><span className="eyebrow-dot" /> A CALMER WAY TO PREPARE YOUR PHOTO</div><h1>Passport photos,<br /><span>made simple.</span></h1><p className="hero-lede">Turn a clear selfie into a neatly sized 35 × 45 mm photo, right from your browser. Review the result before you pay.</p>
         <div className="hero-points"><div><span className="check">✓</span> Processed on your device</div><div><span className="check">✓</span> Ready in about a minute</div></div>
         <div className="price-note"><span className="price-rupee">₹</span><div><strong>₹79</strong><span> per paid download</span></div><span className="price-divider" /><span className="secure-note"><LockIcon /> Pay only when you’re happy</span></div>
       </div>
       <div className={`upload-card ${dragging ? "is-dragging" : ""}`} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={handleDrop}>
         <div className="card-topline"><span className="step-tag">01 <span>/ 03</span></span><span className="privacy-tag"><LockIcon /> PRIVATE BY DESIGN</span></div>
         {stage === "idle" ? <>
-          <div className="upload-icon"><UploadIcon /></div><h2>Start with a selfie</h2><p className="upload-hint">Face the camera in a bright, even light.<br />A plain background makes the best result.</p>
+          <div className="upload-icon"><UploadIcon /></div><h2>Start with a selfie</h2><p className="upload-hint">Face the camera in bright, even light.<br />Leave a little space above your head.</p>
           <button className="primary-button" onClick={() => inputRef.current?.click()}>Choose a photo <span>↗</span></button>
           <input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp" capture="user" onChange={handleChange} hidden />
           <div className="upload-meta"><span>JPG, PNG or WebP</span><i /> <span>Up to 12 MB</span><i /> <span>Drop it here</span></div>
+          <label className="option-row"><span className="option-control"><input type="checkbox" checked={removeBackground} onChange={event => setRemoveBackground(event.target.checked)} /><span className="custom-check" aria-hidden="true">✓</span></span><span><strong>Refine the background</strong><small>Runs on your device. Turn off for a faster crop on a plain wall.</small></span></label>
         </> : <div className="editor">
           {stage === "processing" ? <div className="processing-state"><div className="spinner" /><h2>Preparing your photo</h2><p>Fitting the frame and refining the background. Everything stays in this browser.</p><div className="progress-track"><span /></div></div> : <>
-            <div className="preview-heading"><div><span className="step-tag">02 <span>/ 03</span></span><h2>Your photo preview</h2></div><button className="text-button" onClick={() => { if (original) URL.revokeObjectURL(original); if (result) URL.revokeObjectURL(result.url); setOriginal(null); setStage("idle"); setResult(null); setMessage(""); }}>Start over</button></div>
+            <div className="preview-heading"><div><span className="step-tag">02 <span>/ 03</span></span><h2>Your photo preview</h2></div><button className="text-button" onClick={() => { renderSequence.current += 1; revokeObjectUrl(original); revokeObjectUrl(result?.url); revokeObjectUrl(preparedSource?.url); currentResultUrl.current = null; setOriginal(null); setPreparedSource(null); setStage("idle"); setResult(null); setMessage(""); setPaid(false); setOrderId(null); setFrameWasAdjusted(false); setZoom(1); setVerticalPosition(0.5); setUpdatingFrame(false); }}>Choose another</button></div>
             <div className="preview-wrap"><div className="portrait-frame">{result && <Image src={result.url} alt="Processed passport photo preview" width={413} height={531} unoptimized />}</div><div className="preview-details"><span className="ready-label"><i /> PREVIEW READY</span><strong>35 × 45 mm</strong><span>413 × 531 px · 300 DPI</span><span>JPEG · {result?.sizeKB} KB</span><span className="bg-status">{result?.backgroundRemoved ? "White background · refined" : "White background · review edges"}</span></div></div>
-            <div className="preview-bottom"><span>Review the framing before payment.</span><button className="primary-button pay-button" onClick={() => void download()} disabled={stage === "paying"}>{stage === "paying" ? "Opening checkout…" : <>Download photo <span>₹79&nbsp; ↗</span></>}</button></div>
+            <div className="framing-controls"><div className="control-heading"><strong>Adjust framing</strong><span>Preview updates automatically</span></div><label className="range-row"><span>Zoom <output>{Math.round(zoom * 100)}%</output></span><input type="range" min="1" max="1.5" step="0.01" value={zoom} onChange={event => { renderSequence.current += 1; setZoom(Number(event.target.value)); setFrameWasAdjusted(true); }} /></label><label className="range-row"><span>Vertical position <output>{verticalPosition < 0.4 ? "Move up" : verticalPosition > 0.6 ? "Move down" : "Centered"}</output></span><input type="range" min="0" max="1" step="0.01" value={verticalPosition} onChange={event => { renderSequence.current += 1; setVerticalPosition(Number(event.target.value)); setFrameWasAdjusted(true); }} /></label></div>
+            <div className="preview-bottom"><span>{updatingFrame ? "Updating your crop…" : paid ? "Payment verified · no second charge" : "Review the framing before payment."}</span><button className="primary-button pay-button" onClick={() => void download()} disabled={stage === "paying" || updatingFrame}>{stage === "paying" ? <><span className="button-spinner" /> Opening checkout…</> : updatingFrame ? "Updating preview…" : paid ? <>Download again <span>✓</span></> : <>Continue to payment <span>₹79&nbsp; ↗</span></>}</button></div>
             {original && <details className="compare"><summary>Compare original and result</summary><div className="compare-row"><div><small>ORIGINAL</small><Image src={original} alt="Original selfie" width={100} height={82} unoptimized /></div><div><small>RESULT</small>{result && <Image src={result.url} alt="Processed result" width={100} height={82} unoptimized />}</div></div></details>}
           </>}
         </div>}
@@ -105,8 +171,8 @@ export default function Home() {
         <div className="privacy-foot"><span className="shield"><LockIcon /></span><span>Your photo is processed in this browser and is never uploaded to our servers.</span></div>
       </div>
     </section>
-    <div className="trust-strip"><div><span className="trust-icon"><ShieldIcon /></span><span><b>Private by default</b><small>Photos stay on your device</small></span></div><div><span className="trust-icon"><FrameIcon /></span><span><b>Print-ready sizing</b><small>35 × 45 mm · 300 DPI</small></span></div><div><span className="trust-icon"><SparkIcon /></span><span><b>Made for India</b><small>Passport-style format</small></span></div></div>
-    <section className="how-section" id="how-it-works"><div className="section-heading"><div className="eyebrow">THREE EASY STEPS</div><h2>From selfie to <span>ready.</span></h2><p>Everything you need for a print-ready photo, in one quiet little flow.</p></div><div className="steps"><article><span className="step-num">01</span><div className="step-icon"><UploadIcon /></div><h3>Upload a selfie</h3><p>Choose a clear, front-facing photo with your full face visible and eyes open.</p></article><article><span className="step-num">02</span><div className="step-icon"><WandIcon /></div><h3>Review your preview</h3><p>We fit the frame and prepare a white background. Check the crop before you pay.</p></article><article><span className="step-num">03</span><div className="step-icon"><DownloadIcon /></div><h3>Download your photo</h3><p>Pay ₹79 securely, then get a compact JPEG ready to save and print.</p></article></div></section>
+    <div className="trust-strip"><div><span className="trust-icon"><ShieldIcon /></span><span><b>Private by design</b><small>Your image stays in this browser</small></span></div><div><span className="trust-icon"><FrameIcon /></span><span><b>Precise output</b><small>35 × 45 mm · 300 DPI JPEG</small></span></div><div><span className="trust-icon"><SparkIcon /></span><span><b>Made for India</b><small>Passport-style photo format</small></span></div></div>
+    <section className="how-section" id="how-it-works"><div className="section-heading"><div className="eyebrow">THREE EASY STEPS</div><h2>From selfie to <span>ready.</span></h2><p>Prepare, review, and download in one simple flow.</p></div><div className="steps"><article><span className="step-num">01</span><div className="step-icon"><UploadIcon /></div><h3>Choose your photo</h3><p>Use a clear, front-facing image with your full face visible and eyes open.</p></article><article><span className="step-num">02</span><div className="step-icon"><WandIcon /></div><h3>Review the result</h3><p>Check the crop, background, and file details before choosing to pay.</p></article><article><span className="step-num">03</span><div className="step-icon"><DownloadIcon /></div><h3>Download your JPEG</h3><p>Complete secure checkout, then save your prepared photo.</p></article></div></section>
     <section className="notes-grid"><div className="note-card"><div className="eyebrow">A QUICK NOTE</div><h3>What happens to my photo?</h3><p>Image preparation runs locally in your browser. Razorpay handles checkout; we send it payment details only, never your selfie. Closing the page clears the working preview.</p></div><div className="note-card note-blue"><div className="eyebrow">BEFORE YOU SUBMIT</div><h3>Please check the latest rules</h3><p>This tool prepares the requested size and a plain background. It does not certify that your image meets every current Passport Seva or application-specific photo requirement. Please verify before submitting.</p></div></section>
     <section className="faq-section"><div className="section-heading"><div className="eyebrow">GOOD TO KNOW</div><h2>A few <span>answers.</span></h2></div><div className="faq-list"><details><summary>Does this use AI?</summary><p>Background removal uses an open-source model that runs in your browser when available. We do not call a paid AI service or alter facial features. Suit replacement is not included.</p></details><details><summary>Will it meet every passport photo requirement?</summary><p>The file is sized to 35 × 45 mm at 300 DPI. Requirements can vary and may change; we can’t certify compliance. Please check the latest official instructions for your application.</p></details><details><summary>What if background removal doesn’t work?</summary><p>The photo is still cropped and placed on white, but the original background may remain around you. Review the preview edges carefully and try a selfie taken against a plain wall.</p></details><details><summary>Can I download without paying?</summary><p>In development only, the local preview can be downloaded using a clearly labeled test-mode prompt. Production checkout requires a verified Razorpay payment of ₹79.</p></details></div></section>
     <footer><a className="brand footer-brand" href="#top"><span className="brand-mark"><CameraIcon /></span><span>Photo<span className="brand-accent">Ready</span></span></a><span className="footer-disclaimer">A helpful photo tool, not an official passport service.</span><div className="footer-links"><a href="/privacy">Privacy</a><a href="/terms">Terms</a><a href="/privacy#contact">Contact</a></div><small>© 2026 PhotoReady</small></footer>
