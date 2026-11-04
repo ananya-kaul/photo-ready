@@ -43,32 +43,47 @@ export async function exportCompressedJpeg(canvas: HTMLCanvasElement): Promise<B
   throw new Error("This photo could not be compressed below 50 KB at acceptable quality. Try a simpler photo with less detail.");
 }
 
-export async function makePassportPhoto(file: File, removeBackground: boolean): Promise<PhotoResult> {
+export type PreparedPhoto = { sourceUrl: string; backgroundRemoved: boolean };
+
+export async function preparePhoto(file: File, removeBackground: boolean): Promise<PreparedPhoto> {
   const bitmap = await createImageBitmap(file);
   if (bitmap.width < 240 || bitmap.height < 320) { bitmap.close(); throw new Error("This image is too small. Use a photo at least 240 × 320 pixels."); }
   if (bitmap.width > 8000 || bitmap.height > 8000) { bitmap.close(); throw new Error("This image is too large to process. Choose a smaller photo."); }
-  let source: CanvasImageSource = bitmap;
+  bitmap.close();
+
+  let source: Blob = file;
   let backgroundRemoved = false;
   if (removeBackground) {
     try {
       const { removeBackground: remove } = await import("@imgly/background-removal");
-      const cutout = await remove(file, { output: { format: "image/png", quality: 0.9 } });
-      source = await createImageBitmap(cutout);
+      source = await remove(file, { output: { format: "image/png", quality: 0.9 } });
       backgroundRemoved = true;
-    } catch { /* Continue with a white canvas and disclose that the original background may remain. */ }
+    } catch { /* Continue with a white canvas and disclose that source background pixels may remain. */ }
   }
+  return { sourceUrl: URL.createObjectURL(source), backgroundRemoved };
+}
+
+export async function renderPreparedPhoto(sourceUrl: string, backgroundRemoved: boolean, zoom = 1, verticalPosition = 0.5): Promise<PhotoResult> {
+  const response = await fetch(sourceUrl);
+  if (!response.ok) throw new Error("Could not read the prepared photo. Please choose it again.");
+  const bitmap = await createImageBitmap(await response.blob());
   const canvas = document.createElement("canvas"); canvas.width = PHOTO_WIDTH; canvas.height = PHOTO_HEIGHT;
   const context = canvas.getContext("2d");
   if (!context) { bitmap.close(); throw new Error("Your browser could not prepare the image."); }
   context.fillStyle = "#fff"; context.fillRect(0, 0, canvas.width, canvas.height);
-  const sw = source instanceof ImageBitmap ? source.width : bitmap.width;
-  const sh = source instanceof ImageBitmap ? source.height : bitmap.height;
-  const scale = Math.max(PHOTO_WIDTH / sw, PHOTO_HEIGHT / sh);
-  const cropWidth = PHOTO_WIDTH / scale, cropHeight = PHOTO_HEIGHT / scale;
-  // Center crop follows standard portrait framing. For best placement, upload a selfie with shoulders visible.
-  context.drawImage(source, (sw - cropWidth) / 2, (sh - cropHeight) / 2, cropWidth, cropHeight, 0, 0, PHOTO_WIDTH, PHOTO_HEIGHT);
+  const scale = Math.max(PHOTO_WIDTH / bitmap.width, PHOTO_HEIGHT / bitmap.height);
+  const cropWidth = PHOTO_WIDTH / scale / Math.max(1, zoom);
+  const cropHeight = PHOTO_HEIGHT / scale / Math.max(1, zoom);
+  const cropX = (bitmap.width - cropWidth) / 2;
+  const cropY = (bitmap.height - cropHeight) * Math.min(1, Math.max(0, verticalPosition));
+  context.drawImage(bitmap, cropX, cropY, cropWidth, cropHeight, 0, 0, PHOTO_WIDTH, PHOTO_HEIGHT);
   bitmap.close();
-  if (source instanceof ImageBitmap && source !== bitmap) source.close();
   const blob = await exportCompressedJpeg(canvas);
   return { url: URL.createObjectURL(blob), sizeKB: (blob.size / 1024).toFixed(1), width: PHOTO_WIDTH, height: PHOTO_HEIGHT, backgroundRemoved };
+}
+
+export async function makePassportPhoto(file: File, removeBackground: boolean): Promise<PhotoResult> {
+  const prepared = await preparePhoto(file, removeBackground);
+  try { return await renderPreparedPhoto(prepared.sourceUrl, prepared.backgroundRemoved); }
+  finally { URL.revokeObjectURL(prepared.sourceUrl); }
 }
